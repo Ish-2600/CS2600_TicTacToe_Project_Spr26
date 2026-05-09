@@ -1,5 +1,6 @@
 #!/bin/bash
 
+
   MQTT_HOST="localhost"
   GAME_ID="ismael"
 
