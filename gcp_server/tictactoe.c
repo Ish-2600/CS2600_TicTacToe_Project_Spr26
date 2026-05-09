@@ -82,11 +82,12 @@
 
   void publishGameState() {
       publishBoard();
-      publishAvailable();
 
       if (!gameOver) {
           publishTurn();
       }
+      
+      publishAvailable();
 
       printBoard();
   }
