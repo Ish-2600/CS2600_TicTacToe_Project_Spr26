@@ -7,19 +7,19 @@
   char board[SIZE];
   char currentPlayer = 'X';
   int gameOver = 0;
+  char gameId[64] = "ismael";
 
-  void runCommand(const char *command) {
-      system(command);
-  }
-
-  void publishMessage(const char *topic, const char *message) {
+  void publishMessage(const char *topicSuffix, const char *message) {
+      char topic[128];
       char command[256];
 
+      snprintf(topic, sizeof(topic), "ttt/%s/%s", gameId, topicSuffix);
+
       snprintf(command, sizeof(command),
-               "mosquitto_pub -h localhost -t %s -m \"%s\"",
+               "mosquitto_pub -r -h localhost -t %s -m \"%s\"",
                topic, message);
 
-      runCommand(command);
+      system(command);
   }
 
   void initializeBoard() {
@@ -50,7 +50,7 @@
                board[3], board[4], board[5],
                board[6], board[7], board[8]);
 
-      publishMessage("ttt/game/board", message);
+      publishMessage("game/board", message);
   }
 
   void publishAvailable() {
@@ -70,14 +70,14 @@
           }
       }
 
-      publishMessage("ttt/game/available", message);
+      publishMessage("game/available", message);
   }
 
   void publishTurn() {
       char message[16];
 
       snprintf(message, sizeof(message), "TURN:%c", currentPlayer);
-      publishMessage("ttt/game/status", message);
+      publishMessage("game/status", message);
   }
 
   void publishGameState() {
@@ -86,9 +86,8 @@
       if (!gameOver) {
           publishTurn();
       }
-      
-      publishAvailable();
 
+      publishAvailable();
       printBoard();
   }
 
@@ -128,11 +127,12 @@
   }
 
   int getMoveFromMqtt(char player) {
-      char command[128];
+      char command[256];
       char buffer[32];
 
       snprintf(command, sizeof(command),
-               "mosquitto_sub -h localhost -t ttt/player/%c/move -C 1",
+               "mosquitto_sub -h localhost -t ttt/%s/player/%c/move -C 1",
+               gameId,
                player == 'X' ? 'x' : 'o');
 
       FILE *pipe = popen(command, "r");
@@ -156,13 +156,13 @@
       char message[32];
 
       if (move < 1 || move > 9) {
-          publishMessage("ttt/game/status", "INVALID_MOVE");
+          publishMessage("game/status", "INVALID_MOVE");
           printf("Invalid move received.\n");
           return;
       }
 
       if (board[move - 1] == 'X' || board[move - 1] == 'O') {
-          publishMessage("ttt/game/status", "POSITION_TAKEN");
+          publishMessage("game/status", "POSITION_TAKEN");
           printf("Position already taken.\n");
           return;
       }
@@ -176,7 +176,7 @@
           publishAvailable();
 
           snprintf(message, sizeof(message), "WINNER:%c", currentPlayer);
-          publishMessage("ttt/game/status", message);
+          publishMessage("game/status", message);
 
           printBoard();
           printf("Player %c wins!\n", currentPlayer);
@@ -188,7 +188,7 @@
 
           publishBoard();
           publishAvailable();
-          publishMessage("ttt/game/status", "DRAW");
+          publishMessage("game/status", "DRAW");
 
           printBoard();
           printf("The game is a draw.\n");
@@ -210,9 +210,10 @@
       initializeBoard();
 
       printf("Tic-Tac-Toe MQTT Server\n");
+      printf("Game ID: %s\n", gameId);
       printf("Waiting for moves from MQTT.\n");
-      printf("X moves topic: ttt/player/x/move\n");
-      printf("O moves topic: ttt/player/o/move\n");
+      printf("X moves topic: ttt/%s/player/x/move\n", gameId);
+      printf("O moves topic: ttt/%s/player/o/move\n", gameId);
 
       publishGameState();
 

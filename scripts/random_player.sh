@@ -1,11 +1,14 @@
 #!/bin/bash
 
   MQTT_HOST="localhost"
-  STATUS_TOPIC="ttt/game/status"
-  AVAILABLE_TOPIC="ttt/game/available"
-  MOVE_TOPIC="ttt/player/o/move"
+  GAME_ID="ismael"
+
+  STATUS_TOPIC="ttt/$GAME_ID/game/status"
+  AVAILABLE_TOPIC="ttt/$GAME_ID/game/available"
+  MOVE_TOPIC="ttt/$GAME_ID/player/o/move"
 
   echo "Random player started as O."
+  echo "Game ID: $GAME_ID"
   echo "Waiting for TURN:O..."
 
   mosquitto_sub -h "$MQTT_HOST" -t "$STATUS_TOPIC" | while read STATUS
