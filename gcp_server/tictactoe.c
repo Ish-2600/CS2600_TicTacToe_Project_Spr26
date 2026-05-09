@@ -1,14 +1,31 @@
- #include <stdio.h>
+  #include <stdio.h>
+  #include <stdlib.h>
+  #include <string.h>
 
- #define SIZE 9
+  #define SIZE 9
 
-  void initializeBoard(char board[]) {
+  char board[SIZE];
+  char currentPlayer = 'X';
+
+  void publishMessage(const char *topic, const char *message) {
+      char command[256];
+
+      snprintf(command, sizeof(command),
+               "mosquitto_pub -h localhost -t %s -m \"%s\"",
+               topic, message);
+
+      system(command);
+  }
+
+  void initializeBoard() {
       for (int i = 0; i < SIZE; i++) {
           board[i] = '1' + i;
       }
+
+      currentPlayer = 'X';
   }
 
-  void printBoard(char board[]) {
+  void printBoard() {
       printf("\n");
       printf(" %c | %c | %c\n", board[0], board[1], board[2]);
       printf("---+---+---\n");
@@ -18,7 +35,52 @@
       printf("\n");
   }
 
-  int checkWinner(char board[]) {
+  void publishBoard() {
+      char message[64];
+
+      snprintf(message, sizeof(message),
+               "%c,%c,%c,%c,%c,%c,%c,%c,%c",
+               board[0], board[1], board[2],
+               board[3], board[4], board[5],
+               board[6], board[7], board[8]);
+
+      publishMessage("ttt/game/board", message);
+  }
+
+  void publishAvailable() {
+      char message[64] = "";
+      char temp[8];
+      int first = 1;
+
+      for (int i = 0; i < SIZE; i++) {
+          if (board[i] != 'X' && board[i] != 'O') {
+              if (!first) {
+                  strcat(message, ",");
+              }
+
+              snprintf(temp, sizeof(temp), "%d", i + 1);
+              strcat(message, temp);
+              first = 0;
+          }
+      }
+
+      publishMessage("ttt/game/available", message);
+  }
+
+  void publishTurn() {
+      char message[16];
+
+      snprintf(message, sizeof(message), "TURN:%c", currentPlayer);
+      publishMessage("ttt/game/status", message);
+  }
+
+  void publishGameState() {
+      publishBoard();
+      publishAvailable();
+      publishTurn();
+  }
+
+  int checkWinner() {
       int wins[8][3] = {
           {0, 1, 2},
           {3, 4, 5},
@@ -43,7 +105,7 @@
       return 0;
   }
 
-  int boardFull(char board[]) {
+  int boardFull() {
       for (int i = 0; i < SIZE; i++) {
           if (board[i] != 'X' && board[i] != 'O') {
               return 0;
@@ -54,27 +116,28 @@
   }
 
   int main() {
-      char board[SIZE];
-      char currentPlayer = 'X';
       int move;
       int validInput;
+      char winnerMessage[16];
 
-      initializeBoard(board);
+      initializeBoard();
 
-      printf("Tic-Tac-Toe\n");
+      printf("Tic-Tac-Toe with MQTT publishing\n");
       printf("Player X and Player O take turns choosing positions 1-9.\n");
 
+      publishGameState();
+
       while (1) {
-          printBoard(board);
+          printBoard();
 
           printf("Player %c, enter your move (1-9): ", currentPlayer);
           validInput = scanf("%d", &move);
 
           if (validInput != 1) {
               printf("Invalid input. Please enter a number from 1 to 9.\n");
+              publishMessage("ttt/game/status", "INVALID_INPUT");
 
               while (getchar() != '\n') {
-                  // Clear invalid input
               }
 
               continue;
@@ -82,24 +145,36 @@
 
           if (move < 1 || move > 9) {
               printf("Invalid move. Choose a number from 1 to 9.\n");
+              publishMessage("ttt/game/status", "INVALID_MOVE");
               continue;
           }
 
           if (board[move - 1] == 'X' || board[move - 1] == 'O') {
               printf("That position is already taken. Choose another space.\n");
+              publishMessage("ttt/game/status", "POSITION_TAKEN");
               continue;
           }
 
           board[move - 1] = currentPlayer;
 
-          if (checkWinner(board)) {
-              printBoard(board);
+          publishBoard();
+          publishAvailable();
+
+          if (checkWinner()) {
+              printBoard();
+
+              snprintf(winnerMessage, sizeof(winnerMessage),
+                       "WINNER:%c", currentPlayer);
+
+              publishMessage("ttt/game/status", winnerMessage);
+
               printf("Player %c wins!\n", currentPlayer);
               break;
           }
 
-          if (boardFull(board)) {
-              printBoard(board);
+          if (boardFull()) {
+              printBoard();
+              publishMessage("ttt/game/status", "DRAW");
               printf("The game is a draw.\n");
               break;
           }
@@ -109,6 +184,8 @@
           } else {
               currentPlayer = 'X';
           }
+
+          publishTurn();
       }
 
       return 0;
