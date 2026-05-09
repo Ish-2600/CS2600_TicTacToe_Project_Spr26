@@ -158,12 +158,14 @@
       if (move < 1 || move > 9) {
           publishMessage("game/status", "INVALID_MOVE");
           printf("Invalid move received.\n");
+          publishGameState();
           return;
       }
 
       if (board[move - 1] == 'X' || board[move - 1] == 'O') {
           publishMessage("game/status", "POSITION_TAKEN");
           printf("Position already taken.\n");
+          publishGameState();
           return;
       }
 
