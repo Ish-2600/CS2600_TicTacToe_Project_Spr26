@@ -6,6 +6,11 @@
 
   char board[SIZE];
   char currentPlayer = 'X';
+  int gameOver = 0;
+
+  void runCommand(const char *command) {
+      system(command);
+  }
 
   void publishMessage(const char *topic, const char *message) {
       char command[256];
@@ -14,7 +19,7 @@
                "mosquitto_pub -h localhost -t %s -m \"%s\"",
                topic, message);
 
-      system(command);
+      runCommand(command);
   }
 
   void initializeBoard() {
@@ -23,6 +28,7 @@
       }
 
       currentPlayer = 'X';
+      gameOver = 0;
   }
 
   void printBoard() {
@@ -77,7 +83,12 @@
   void publishGameState() {
       publishBoard();
       publishAvailable();
-      publishTurn();
+
+      if (!gameOver) {
+          publishTurn();
+      }
+
+      printBoard();
   }
 
   int checkWinner() {
@@ -115,78 +126,106 @@
       return 1;
   }
 
-  int main() {
-      int move;
-      int validInput;
-      char winnerMessage[16];
+  int getMoveFromMqtt(char player) {
+      char command[128];
+      char buffer[32];
 
-      initializeBoard();
+      snprintf(command, sizeof(command),
+               "mosquitto_sub -h localhost -t ttt/player/%c/move -C 1",
+               player == 'X' ? 'x' : 'o');
 
-      printf("Tic-Tac-Toe with MQTT publishing\n");
-      printf("Player X and Player O take turns choosing positions 1-9.\n");
+      FILE *pipe = popen(command, "r");
 
-      publishGameState();
+      if (pipe == NULL) {
+          printf("Could not read MQTT move.\n");
+          return -1;
+      }
 
-      while (1) {
-          printBoard();
+      if (fgets(buffer, sizeof(buffer), pipe) == NULL) {
+          pclose(pipe);
+          return -1;
+      }
 
-          printf("Player %c, enter your move (1-9): ", currentPlayer);
-          validInput = scanf("%d", &move);
+      pclose(pipe);
 
-          if (validInput != 1) {
-              printf("Invalid input. Please enter a number from 1 to 9.\n");
-              publishMessage("ttt/game/status", "INVALID_INPUT");
+      return atoi(buffer);
+  }
 
-              while (getchar() != '\n') {
-              }
+  void processMove(int move) {
+      char message[32];
 
-              continue;
-          }
+      if (move < 1 || move > 9) {
+          publishMessage("ttt/game/status", "INVALID_MOVE");
+          printf("Invalid move received.\n");
+          return;
+      }
 
-          if (move < 1 || move > 9) {
-              printf("Invalid move. Choose a number from 1 to 9.\n");
-              publishMessage("ttt/game/status", "INVALID_MOVE");
-              continue;
-          }
+      if (board[move - 1] == 'X' || board[move - 1] == 'O') {
+          publishMessage("ttt/game/status", "POSITION_TAKEN");
+          printf("Position already taken.\n");
+          return;
+      }
 
-          if (board[move - 1] == 'X' || board[move - 1] == 'O') {
-              printf("That position is already taken. Choose another space.\n");
-              publishMessage("ttt/game/status", "POSITION_TAKEN");
-              continue;
-          }
+      board[move - 1] = currentPlayer;
 
-          board[move - 1] = currentPlayer;
+      if (checkWinner()) {
+          gameOver = 1;
 
           publishBoard();
           publishAvailable();
 
-          if (checkWinner()) {
-              printBoard();
+          snprintf(message, sizeof(message), "WINNER:%c", currentPlayer);
+          publishMessage("ttt/game/status", message);
 
-              snprintf(winnerMessage, sizeof(winnerMessage),
-                       "WINNER:%c", currentPlayer);
-
-              publishMessage("ttt/game/status", winnerMessage);
-
-              printf("Player %c wins!\n", currentPlayer);
-              break;
-          }
-
-          if (boardFull()) {
-              printBoard();
-              publishMessage("ttt/game/status", "DRAW");
-              printf("The game is a draw.\n");
-              break;
-          }
-
-          if (currentPlayer == 'X') {
-              currentPlayer = 'O';
-          } else {
-              currentPlayer = 'X';
-          }
-
-          publishTurn();
+          printBoard();
+          printf("Player %c wins!\n", currentPlayer);
+          return;
       }
+
+      if (boardFull()) {
+          gameOver = 1;
+
+          publishBoard();
+          publishAvailable();
+          publishMessage("ttt/game/status", "DRAW");
+
+          printBoard();
+          printf("The game is a draw.\n");
+          return;
+      }
+
+      if (currentPlayer == 'X') {
+          currentPlayer = 'O';
+      } else {
+          currentPlayer = 'X';
+      }
+
+      publishGameState();
+  }
+
+  int main() {
+      int move;
+
+      initializeBoard();
+
+      printf("Tic-Tac-Toe MQTT Server\n");
+      printf("Waiting for moves from MQTT.\n");
+      printf("X moves topic: ttt/player/x/move\n");
+      printf("O moves topic: ttt/player/o/move\n");
+
+      publishGameState();
+
+      while (!gameOver) {
+          printf("Waiting for Player %c move...\n", currentPlayer);
+
+          move = getMoveFromMqtt(currentPlayer);
+
+          printf("Received move: %d\n", move);
+
+          processMove(move);
+      }
+
+      printf("Game over. Restart the program to play again.\n");
 
       return 0;
   }
