@@ -1,12 +1,28 @@
-#include "raylib.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define CLAY_IMPLEMENTATION
+#include "clay.h"
+#include "renderers/raylib/clay_renderer_raylib.c"
 
 #define SCREEN_WIDTH 900
 #define SCREEN_HEIGHT 700
 
 void updateBoardFromMessage(char board[], const char *message);
+
+typedef struct {
+    FILE *pipe;
+    pid_t pid;
+} MqttSubscriber;
+
+static void handleClayErrors(Clay_ErrorData errorData) {
+    printf("%.*s\n", errorData.errorText.length, errorData.errorText.chars);
+}
 
 void publishMove(const char *mqttHost, const char *gameId, const char *playerRole, int move) {
     char command[512];
@@ -70,6 +86,118 @@ int checkConnection(const char *mqttHost, const char *gameId, char board[], char
     }
 
     return 1;
+}
+
+void stopMqttSubscriber(MqttSubscriber *subscriber) {
+    if (subscriber->pipe != NULL) {
+        if (subscriber->pid > 0) {
+            kill(subscriber->pid, SIGTERM);
+        }
+
+        fclose(subscriber->pipe);
+
+        if (subscriber->pid > 0) {
+            waitpid(subscriber->pid, NULL, WNOHANG);
+        }
+
+        subscriber->pipe = NULL;
+        subscriber->pid = 0;
+    }
+}
+
+int startMqttSubscriber(MqttSubscriber *subscriber, const char *mqttHost, const char *gameId) {
+    char topic[128];
+    int pipeFd[2];
+
+    stopMqttSubscriber(subscriber);
+
+    snprintf(topic, sizeof(topic), "ttt/%s/game/#", gameId);
+
+    if (pipe(pipeFd) != 0) {
+        return 0;
+    }
+
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        close(pipeFd[0]);
+        close(pipeFd[1]);
+        return 0;
+    }
+
+    if (pid == 0) {
+        int devNull = open("/dev/null", O_WRONLY);
+
+        dup2(pipeFd[1], STDOUT_FILENO);
+
+        if (devNull >= 0) {
+            dup2(devNull, STDERR_FILENO);
+            close(devNull);
+        }
+
+        close(pipeFd[0]);
+        close(pipeFd[1]);
+
+        execlp("mosquitto_sub", "mosquitto_sub", "-h", mqttHost, "-t", topic, "-v", NULL);
+        _exit(1);
+    }
+
+    close(pipeFd[1]);
+
+    subscriber->pipe = fdopen(pipeFd[0], "r");
+
+    if (subscriber->pipe == NULL) {
+        close(pipeFd[0]);
+        kill(pid, SIGTERM);
+        waitpid(pid, NULL, WNOHANG);
+        return 0;
+    }
+
+    subscriber->pid = pid;
+
+    int fd = fileno(subscriber->pipe);
+    int flags = fcntl(fd, F_GETFL, 0);
+
+    if (flags != -1) {
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    return 1;
+}
+
+void handleMqttLine(const char *gameId, const char *line, char board[], char status[], int statusSize) {
+    char topic[128];
+    char payload[128];
+    char boardTopic[128];
+    char statusTopic[128];
+
+    if (sscanf(line, "%127s %127[^\n]", topic, payload) != 2) {
+        return;
+    }
+
+    snprintf(boardTopic, sizeof(boardTopic), "ttt/%s/game/board", gameId);
+    snprintf(statusTopic, sizeof(statusTopic), "ttt/%s/game/status", gameId);
+
+    if (strcmp(topic, boardTopic) == 0) {
+        updateBoardFromMessage(board, payload);
+    } else if (strcmp(topic, statusTopic) == 0) {
+        snprintf(status, statusSize, "%s", payload);
+    }
+}
+
+void pollMqttSubscriber(MqttSubscriber *subscriber, const char *gameId, char board[], char status[], int statusSize) {
+    char line[256];
+
+    if (subscriber->pipe == NULL) {
+        return;
+    }
+
+    while (fgets(line, sizeof(line), subscriber->pipe) != NULL) {
+        line[strcspn(line, "\n")] = '\0';
+        handleMqttLine(gameId, line, board, status, statusSize);
+    }
+
+    clearerr(subscriber->pipe);
 }
 
 void updateBoardFromMessage(char board[], const char *message) {
@@ -145,29 +273,65 @@ void handleTextInput(char *text, int maxLength) {
     }
 }
 
+void drawStatusText(const char *status, int x, int y, int maxCharsPerLine) {
+    char line[96];
+    int lineLength = 0;
+    int lineY = y;
+
+    for (int i = 0; status[i] != '\0'; i++) {
+        line[lineLength++] = status[i];
+
+        if (lineLength >= maxCharsPerLine || status[i + 1] == '\0') {
+            line[lineLength] = '\0';
+            DrawText(line, x, lineY, 18, MAROON);
+            lineLength = 0;
+            lineY += 24;
+        }
+    }
+}
+
 int main(void) {
-    InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "Tic-Tac-Toe MQTT GUI");
+    Clay_Raylib_Initialize(SCREEN_WIDTH, SCREEN_HEIGHT, "Tic-Tac-Toe MQTT GUI", 0);
     SetTargetFPS(60);
+
+    uint64_t clayMemorySize = Clay_MinMemorySize();
+    void *clayMemory = malloc(clayMemorySize);
+
+    if (clayMemory == NULL) {
+        fprintf(stderr, "Could not allocate Clay memory.\n");
+        Clay_Raylib_Close();
+        return 1;
+    }
+
+    Clay_Arena clayArena = Clay_CreateArenaWithCapacityAndMemory(clayMemorySize, clayMemory);
+
+    Clay_Initialize(
+        clayArena,
+        (Clay_Dimensions){ SCREEN_WIDTH, SCREEN_HEIGHT },
+        (Clay_ErrorHandler){ handleClayErrors }
+    );
+
+    Font fonts[1] = { GetFontDefault() };
+    Clay_SetMeasureTextFunction(Raylib_MeasureText, fonts);
 
     char mqttHost[128] = "ishserver.duckdns.org";
     char gameId[64] = "ismael";
     char playerRole[8] = "x";
     char board[9] = {'1','2','3','4','5','6','7','8','9'};
     char status[128] = "Edit settings, choose player, then connect";
-    double lastMqttUpdate = 0.0;
-
     int activeInput = 0;
     int connected = 0;
+    MqttSubscriber subscriber = {0};
 
-    Rectangle hostBox = {40, 95, 330, 45};
-    Rectangle gameBox = {40, 170, 330, 45};
-    Rectangle xButton = {40, 245, 70, 42};
-    Rectangle oButton = {120, 245, 70, 42};
-    Rectangle connectButton = {40, 315, 150, 45};
-    Rectangle disconnectButton = {205, 315, 150, 45};
+    Rectangle hostBox = {44, 105, 310, 45};
+    Rectangle gameBox = {44, 185, 310, 45};
+    Rectangle xButton = {44, 265, 70, 42};
+    Rectangle oButton = {124, 265, 70, 42};
+    Rectangle connectButton = {44, 340, 140, 45};
+    Rectangle disconnectButton = {198, 340, 150, 45};
 
     while (!WindowShouldClose()) {
-        double now = GetTime();
+        float deltaTime = GetFrameTime();
 
         if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
             Vector2 mouse = GetMousePosition();
@@ -194,18 +358,23 @@ int main(void) {
                 resetBoard(board);
 
                 if (checkConnection(mqttHost, gameId, board, status, sizeof(status))) {
-                    connected = 1;
-                    lastMqttUpdate = now;
+                    if (startMqttSubscriber(&subscriber, mqttHost, gameId)) {
+                        connected = 1;
+                    } else {
+                        connected = 0;
+                        snprintf(status, sizeof(status), "Could not start MQTT subscriber.");
+                    }
                 } else {
                     connected = 0;
                 }
             }
 
             if (connected && CheckCollisionPointRec(mouse, disconnectButton)) {
+                stopMqttSubscriber(&subscriber);
                 connected = 0;
                 activeInput = 0;
                 resetBoard(board);
-                snprintf(status, sizeof(status), "Disconnected. Edit settings, then connect");
+                snprintf(status, sizeof(status), "Disconnected. Edit settings,  then connect");
             }
         }
 
@@ -215,20 +384,69 @@ int main(void) {
             handleTextInput(gameId, sizeof(gameId));
         }
 
-        if (connected && now - lastMqttUpdate >= 0.35) {
-            updateFromMqtt(mqttHost, gameId, board, status, sizeof(status));
-            lastMqttUpdate = now;
+        if (connected) {
+            pollMqttSubscriber(&subscriber, gameId, board, status, sizeof(status));
         }
 
-        BeginDrawing();
-        ClearBackground(RAYWHITE);
+        Clay_SetLayoutDimensions((Clay_Dimensions){
+            (float)GetScreenWidth(),
+            (float)GetScreenHeight()
+        });
 
-        DrawText("Tic-Tac-Toe MQTT GUI", 40, 30, 32, BLACK);
+        Vector2 mouse = GetMousePosition();
+        Clay_SetPointerState(
+            (Clay_Vector2){ mouse.x, mouse.y },
+            IsMouseButtonDown(MOUSE_BUTTON_LEFT)
+        );
+
+        Clay_BeginLayout();
+
+        CLAY(CLAY_ID("Root"), {
+            .layout = {
+                .sizing = {
+                    .width = CLAY_SIZING_GROW(0),
+                    .height = CLAY_SIZING_GROW(0)
+                },
+                .padding = CLAY_PADDING_ALL(24),
+                .childGap = 20,
+                .layoutDirection = CLAY_LEFT_TO_RIGHT
+            },
+            .backgroundColor = { 248, 248, 246, 255 }
+        }) {
+            CLAY(CLAY_ID("SettingsPanel"), {
+                .layout = {
+                    .sizing = {
+                        .width = CLAY_SIZING_FIXED(360),
+                        .height = CLAY_SIZING_GROW(0)
+                    }
+                },
+                .backgroundColor = { 236, 240, 243, 255 },
+                .cornerRadius = CLAY_CORNER_RADIUS(8)
+            }) {}
+
+            CLAY(CLAY_ID("BoardPanel"), {
+                .layout = {
+                    .sizing = {
+                        .width = CLAY_SIZING_GROW(0),
+                        .height = CLAY_SIZING_GROW(0)
+                    }
+                },
+                .backgroundColor = { 255, 255, 255, 255 },
+                .cornerRadius = CLAY_CORNER_RADIUS(8)
+            }) {}
+        }
+
+        Clay_RenderCommandArray clayCommands = Clay_EndLayout(deltaTime);
+
+        BeginDrawing();
+        Clay_Raylib_Render(clayCommands, fonts);
+
+        DrawText("Tic-Tac-Toe MQTT GUI", 44, 34, 28, BLACK);
 
         drawTextBox(hostBox, "MQTT Host", mqttHost, activeInput == 1, !connected);
         drawTextBox(gameBox, "Game ID", gameId, activeInput == 2, !connected);
 
-        DrawText("Player", 40, 220, 18, DARKGRAY);
+        DrawText("Player", 44, 240, 18, DARKGRAY);
 
         DrawRectangleRec(xButton, strcmp(playerRole, "x") == 0 ? BLUE : LIGHTGRAY);
         DrawText("X", (int)xButton.x + 26, (int)xButton.y + 10, 22,
@@ -246,12 +464,14 @@ int main(void) {
         DrawText("Disconnect", (int)disconnectButton.x + 20, (int)disconnectButton.y + 12, 20,
                  connected ? WHITE : DARKGRAY);
 
-        DrawText("Status:", 40, 395, 20, DARKGRAY);
-        DrawText(status, 130, 395, 20, MAROON);
+        DrawText("Status", 44, 420, 20, DARKGRAY);
+        drawStatusText(status, 44, 452, 31);
 
-        int boardX = 470;
-        int boardY = 150;
-        int cellSize = 110;
+        DrawText("Board", 500, 88, 24, DARKGRAY);
+
+        int boardX = 500;
+        int boardY = 135;
+        int cellSize = 105;
 
         for (int row = 0; row < 3; row++) {
             for (int col = 0; col < 3; col++) {
@@ -281,19 +501,19 @@ int main(void) {
 
                         snprintf(status, sizeof(status),
                                  "Sent move %d as Player %s", move, playerRole);
-
-                        updateFromMqtt(mqttHost, gameId, board, status, sizeof(status));
                     }
                 }
             }
         }
 
-        DrawText("Edit settings while disconnected. Connect before playing.", 40, 640, 18, DARKGRAY);
+        DrawText("Edit settings while disconnected. Connect before playing.", 44, 642, 18, DARKGRAY);
 
         EndDrawing();
     }
 
-    CloseWindow();
+    stopMqttSubscriber(&subscriber);
+    Clay_Raylib_Close();
+    free(clayMemory);
 
     return 0;
 }
